@@ -9,6 +9,7 @@ import math
 import mathutils
 import mathutils.geometry
 import mathutils.bvhtree
+import mathutils.kdtree
 import numpy as np
 from gpu_extras.batch import batch_for_shader
 from bpy_extras import view3d_utils
@@ -16,10 +17,10 @@ from bpy_extras import view3d_utils
 bl_info = {
     "name": "2D PolySketch Suite",
     "author": "Anupska",
-    "version": (1, 0, 0),
+    "version": (1, 2, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > N-Panel > Create > 2D PolySketch",
-    "description": "Object Mode 2D Drafting (Poly Sketch) and Edit Mode Face Cutting (Poly Cut) & Exact CAD Offset (Poly Offset).",
+    "description": "Precision CAD 2D sketching, face cutting, and exact miter polyline offset.",
     "category": "Mesh",
 }
 
@@ -28,7 +29,6 @@ SNAPPABLE_TYPES = {'MESH', 'CURVE', 'SURFACE', 'FONT'}
 SNAP_RADIUS_PX  = 14.0     # Geometry snap radius
 CLOSE_RADIUS_PX = 12.0     # Loop-close radius
 
-# Distance priority bias (added to pixel distance so a vertex beats a nearby edge)
 SNAP_BIAS_PX = {'VERTEX': 0.0, 'MIDPOINT': 4.0, 'PERPENDICULAR': 6.0, 'EDGE': 10.0}
 
 SNAP_COLORS = {
@@ -137,7 +137,8 @@ def build_geo_cache(context):
             continue
         try:
             mesh = obj.to_mesh()
-        except Exception:
+        except Exception as ex:
+            print(f"[PolySketch Notice] to_mesh conversion warning: {ex}")
             continue
         try:
             nv, ne = len(mesh.vertices), len(mesh.edges)
@@ -432,6 +433,10 @@ def draw_callback_3d_sketch(self, context):
     if bpy.context.area != self.area:
         return
 
+    region, rv3d = get_3d_region_and_rv3d(bpy.context)
+    if not region:
+        return
+
     gpu.state.blend_set('ALPHA')
 
     if self.stage == 'PLANE_SELECT':
@@ -441,7 +446,6 @@ def draw_callback_3d_sketch(self, context):
         grid_positions = []
         grid_colors = []
         
-        rv3d = getattr(self, 'rv3d', None)
         view_dist = rv3d.view_distance if rv3d else 5.0
         radius = max(0.5, view_dist * 0.3)
         step = radius / 6.0
@@ -467,31 +471,34 @@ def draw_callback_3d_sketch(self, context):
             batch_grid.draw(shader)
 
     elif self.stage == 'DRAWING' and len(self.points) > 0:
-        shader_solid = gpu.shader.from_builtin('UNIFORM_COLOR')
-        shader_solid.bind()
+        shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+        shader.bind()
+        shader.uniform_float("viewportSize", (float(region.width), float(region.height)))
 
-        gpu.state.line_width_set(3.5)
         line_color = (1.0, 0.35, 0.1, 1.0) if self.tool_mode == 'CUT' else (0.1, 0.8, 1.0, 1.0)
-        shader_solid.uniform_float("color", line_color)
-        batch_lines = batch_for_shader(shader_solid, 'LINE_STRIP', {"pos": self.points})
-        batch_lines.draw(shader_solid)
-
-        gpu.state.point_size_set(8.0)
-        shader_solid.uniform_float("color", (1.0, 1.0, 1.0, 1.0))
-        batch_pts = batch_for_shader(shader_solid, 'POINTS', {"pos": self.points})
-        batch_pts.draw(shader_solid)
-
-        gpu.state.point_size_set(14.0)
-        shader_solid.uniform_float("color", (1.0, 0.5, 0.0, 1.0))
-        batch_start = batch_for_shader(shader_solid, 'POINTS', {"pos": [self.points[0]]})
-        batch_start.draw(shader_solid)
+        shader.uniform_float("lineWidth", 3.5)
+        shader.uniform_float("color", line_color)
+        batch_lines = batch_for_shader(shader, 'LINE_STRIP', {"pos": self.points})
+        batch_lines.draw(shader)
 
         if self.active_pt:
             color = (1.0, 0.25, 0.25, 1.0) if self.axis_snapped else (0.2, 0.95, 0.35, 1.0)
-            gpu.state.line_width_set(3.0)
-            shader_solid.uniform_float("color", color)
-            batch_guide = batch_for_shader(shader_solid, 'LINE_STRIP', {"pos": [self.points[-1], self.active_pt]})
-            batch_guide.draw(shader_solid)
+            shader.uniform_float("lineWidth", 3.0)
+            shader.uniform_float("color", color)
+            batch_guide = batch_for_shader(shader, 'LINE_STRIP', {"pos": [self.points[-1], self.active_pt]})
+            batch_guide.draw(shader)
+
+        shader_pt = gpu.shader.from_builtin('UNIFORM_COLOR')
+        shader_pt.bind()
+        gpu.state.point_size_set(8.0)
+        shader_pt.uniform_float("color", (1.0, 1.0, 1.0, 1.0))
+        batch_pts = batch_for_shader(shader_pt, 'POINTS', {"pos": self.points})
+        batch_pts.draw(shader_pt)
+
+        gpu.state.point_size_set(14.0)
+        shader_pt.uniform_float("color", (1.0, 0.5, 0.0, 1.0))
+        batch_start = batch_for_shader(shader_pt, 'POINTS', {"pos": [self.points[0]]})
+        batch_start.draw(shader_pt)
 
     gpu.state.blend_set('NONE')
     gpu.state.line_width_set(1.0)
@@ -642,8 +649,8 @@ def split_and_build_sketch_bmesh(points, closed, plane_origin, plane_normal, pla
     bm.edges.ensure_lookup_table()
     try:
         bmesh.ops.edgenet_fill(bm, edges=bm.edges[:])
-    except Exception:
-        pass
+    except Exception as ex:
+        print(f"[PolySketch Notice] edgenet_fill: {ex}")
 
     return bm
 
@@ -816,8 +823,8 @@ def merge_sketch_into_edit_mesh(edit_obj, segments, plane_origin, plane_normal, 
         if face_cut_edges:
             try:
                 bmesh.utils.face_split_edgenet(f, face_cut_edges)
-            except Exception:
-                pass
+            except Exception as ex:
+                print(f"[PolyCut Notice] face_split_edgenet: {ex}")
 
     for e in new_edges:
         if e.is_valid:
@@ -1174,7 +1181,7 @@ class MESH_OT_poly_cut_2d(CAD_OT_2d_base):
 
 
 # ==============================================================================
-# 4. POLY OFFSET ENGINE (v2.4.0)
+# 4. POLY OFFSET ENGINE (v1.2.0)
 # ==============================================================================
 
 _line_isect = lambda p, r, q, s: (p + r * (((q - p).x * s.y - (q - p).y * s.x) / (r.x * s.y - r.y * s.x))) if abs(r.x * s.y - r.y * s.x) >= 1e-12 else None
@@ -1209,7 +1216,16 @@ def offset_polyline_2d(pts, dist, closed):
 
         a0, d0 = segs[(i - 1) % num]
         a1, d1 = segs[i % num]
-        hit = _line_isect(a0, d0, a1, d1)
+        
+        den = d0.x * d1.y - d0.y * d1.x
+        if abs(den) < 1e-4:
+            if d0.dot(d1) > 0.0:
+                hit = pts[i] + (a0 - pts[(i - 1) % n])  # Straight run collinear stabilization
+            else:
+                hit = a1                                # Fold-back corner
+        else:
+            hit = _line_isect(a0, d0, a1, d1)
+
         if hit is None:
             hit = a1
 
@@ -1290,6 +1306,78 @@ def calc_max_inward_clamp(pts_2d):
                 max_d = t_c
 
     return max_d
+
+def chain_adjacent_faces(bm, vert_indices, closed):
+    n = len(vert_indices)
+    out = []
+    seen = set()
+    for i in range(n if closed else n - 1):
+        v1 = bm.verts[vert_indices[i]]
+        v2 = bm.verts[vert_indices[(i + 1) % n]]
+        e = bm.edges.get((v1, v2))
+        if e and is_valid_elem(e):
+            for f in e.link_faces:
+                if is_valid_elem(f) and f.index not in seen:
+                    seen.add(f.index)
+                    out.append(f)
+    return out
+
+def pick_face_under_cursor(cands, chain_pts, ray_o, ray_d):
+    if not cands or len(chain_pts) < 2:
+        return None
+
+    extent = max((p - chain_pts[0]).length for p in chain_pts)
+    plane_tol = 1e-4 * extent + 1e-6
+
+    best, best_t = None, None
+    num_pts = len(chain_pts)
+
+    for n, c in cands:
+        # Filter candidate planes that do not contain the whole chain
+        if any(abs((p - c).dot(n)) > plane_tol for p in chain_pts):
+            continue
+
+        denom = ray_d.dot(n)
+        if abs(denom) < 1e-6:
+            continue
+        t = (c - ray_o).dot(n) / denom
+        if t <= 0:
+            continue
+        hit = ray_o + ray_d * t
+
+        best_seg_idx = 0
+        best_seg_d2 = float('inf')
+        for i in range(num_pts - 1):
+            p1, p2 = chain_pts[i], chain_pts[i + 1]
+            seg = p2 - p1
+            l2 = seg.length_squared
+            if l2 < 1e-12:
+                continue
+            fac = max(0.0, min(1.0, (hit - p1).dot(seg) / l2))
+            proj = p1 + seg * fac
+            d2 = (hit - proj).length_squared
+            if d2 < best_seg_d2:
+                best_seg_d2 = d2
+                best_seg_idx = i
+
+        p1, p2 = chain_pts[best_seg_idx], chain_pts[best_seg_idx + 1]
+        edge_dir = (p2 - p1).normalized() if (p2 - p1).length_squared > 1e-12 else mathutils.Vector((1, 0, 0))
+
+        inward = c - p1
+        inward -= edge_dir * inward.dot(edge_dir)
+        inward -= n * inward.dot(n)
+        if inward.length < 1e-9:
+            continue
+        inward = inward.normalized()
+
+        if (hit - p1).dot(inward) <= 0:
+            continue
+
+        if best is None or t < best_t:
+            best = (c, n)
+            best_t = t
+
+    return best
 
 def collect_offset_chains(bm, mw):
     bm.verts.index_update()
@@ -1375,7 +1463,8 @@ def replace_face_with_ring(bm, face, orig_verts, off_verts):
             return None
         try:
             f = bm.faces.new(vs)
-        except ValueError:
+        except ValueError as ex:
+            print(f"[PolyOffset Notice] Face creation warning: {ex}")
             return None
         f.normal_update()
         if f.normal.dot(ref_n) < 0:
@@ -1399,7 +1488,8 @@ def add_ring_only(bm, face, orig_verts, off_verts):
             continue
         try:
             q = bm.faces.new(vs)
-        except ValueError:
+        except ValueError as ex:
+            print(f"[PolyOffset Notice] Ring face creation warning: {ex}")
             continue
         q.normal_update()
         if q.normal.dot(ref_n) < 0:
@@ -1444,9 +1534,39 @@ def commit_polyline_offset(bm, orig_indices, world_poly, plane_origin_w, plane_n
     vert_map = {}
     created_verts = []
 
+    # Static KDTree mapping to stored vertex objects
+    kd_objs = []
+    kd = mathutils.kdtree.KDTree(max(1, len(bm.verts)))
+    for v in bm.verts:
+        if is_valid_elem(v):
+            kd.insert(v.co, len(kd_objs))
+            kd_objs.append(v)
+    kd.balance()
+
+    # Dynamic spatial hash for new vertices created during split
+    cell = max(local_tol, 1e-9)
+    new_cells = {}
+
+    def _ck(p):
+        return (math.floor(p.x / cell), math.floor(p.y / cell), math.floor(p.z / cell))
+
+    def _remember(v):
+        new_cells.setdefault(_ck(v.co), []).append(v)
+
+    def _find_new(p3d):
+        cx, cy, cz = _ck(p3d)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    for v in new_cells.get((cx + dx, cy + dy, cz + dz), ()):
+                        if is_valid_elem(v) and (v.co - p3d).length < local_tol:
+                            return v
+        return None
+
     def register_vert(v):
         key = (round(to_2d(v.co).x, 4), round(to_2d(v.co).y, 4))
         vert_map[key] = v
+        _remember(v)
         return v
 
     def get_or_create_vert(p2d):
@@ -1455,13 +1575,16 @@ def commit_polyline_offset(bm, orig_indices, world_poly, plane_origin_w, plane_n
         if v is not None and is_valid_elem(v):
             return v
         p3d = to_3d(p2d)
-        for ev in bm.verts:
-            if is_valid_elem(ev) and (ev.co - p3d).length < local_tol:
-                vert_map[key] = ev
-                return ev
-        v = bm.verts.new(p3d)
+        v = _find_new(p3d)
+        if v is None and kd_objs:
+            _co, i, d = kd.find(p3d)
+            if d <= local_tol and is_valid_elem(kd_objs[i]):
+                v = kd_objs[i]
+        if v is None:
+            v = bm.verts.new(p3d)
+            created_verts.append(v)
+            _remember(v)
         vert_map[key] = v
-        created_verts.append(v)
         return v
 
     if is_closed:
@@ -1520,10 +1643,11 @@ def commit_polyline_offset(bm, orig_indices, world_poly, plane_origin_w, plane_n
                         register_vert(v_split)
                     splits.append((max(0.0, min(1.0, t_seg)), mathutils.Vector(hit)))
                 except Exception as ex:
-                    print(f"[Poly Offset] Edge split notice: {ex}")
+                    print(f"[PolyOffset Notice] Edge split exception: {ex}")
 
     new_edges = []
-    for splits in seg_splits:
+    path_edges = []
+    for idx_sp, splits in enumerate(seg_splits):
         splits.sort(key=lambda item: item[0])
         prev_v = None
         for t, p in splits:
@@ -1532,6 +1656,8 @@ def commit_polyline_offset(bm, orig_indices, world_poly, plane_origin_w, plane_n
                 if (v.co - prev_v.co).length > local_tol * 0.5:
                     ne = bm.edges.get((prev_v, v)) or bm.edges.new((prev_v, v))
                     new_edges.append(ne)
+                    if idx_sp < num_segs:
+                        path_edges.append(ne)
             prev_v = v
 
     bm.verts.ensure_lookup_table()
@@ -1558,7 +1684,7 @@ def commit_polyline_offset(bm, orig_indices, world_poly, plane_origin_w, plane_n
                     if is_valid_elem(sf):
                         sliced_faces.append(sf)
             except Exception as ex:
-                print(f"[Poly Offset] face_split_edgenet notice: {ex}")
+                print(f"[PolyOffset Notice] face_split_edgenet: {ex}")
 
     valid_created = [v for v in created_verts if is_valid_elem(v)]
     if valid_created:
@@ -1569,14 +1695,14 @@ def commit_polyline_offset(bm, orig_indices, world_poly, plane_origin_w, plane_n
     if orphans:
         warn_msg = f"Poly Offset: {len(orphans)} offset edges did not split their face"
 
-    return [e for e in new_edges if is_valid_elem(e)], warn_msg
+    return [e for e in path_edges if is_valid_elem(e)], warn_msg
 
 def draw_callback_3d_offset(self, context):
     if bpy.context.area != self.area:
         return
 
     region, rv3d = get_3d_region_and_rv3d(bpy.context)
-    if not region or not self.preview_chains:
+    if not region or not getattr(self, 'preview_chains', None):
         return
 
     gpu.state.blend_set('ALPHA')
@@ -1627,23 +1753,29 @@ def draw_callback_2d_offset(self, context):
     blf.size(font_id, int(13 * ui_scale))
 
     dist = getattr(self, 'offset_dist', 0.0)
-    side_lbl = "Inward" if getattr(self, 'is_inset_state', False) else "Outward"
+    c0_closed = self.chains[0]['closed'] if getattr(self, 'chains', None) else True
+
+    if c0_closed:
+        side_lbl = "Inward" if getattr(self, 'is_inset_state', False) else "Outward"
+        dist_str = f"{format_unit_length(bpy.context, abs(dist))} ({side_lbl})"
+    else:
+        dist_str = format_unit_length(bpy.context, abs(dist))
+
     clamp_lbl = "ON" if getattr(self, 'clamp_overlap', True) else "OFF"
-    dist_str = format_unit_length(bpy.context, abs(dist))
 
     cx, cy = self.mouse_2d.x, self.mouse_2d.y
     blf.position(font_id, int(cx + 20 * ui_scale), int(cy + 12 * ui_scale), 0)
     if self.typed_buffer:
         blf.color(font_id, 1.0, 0.5, 0.0, 1.0)
-        blf.draw(font_id, f"Distance: {self.typed_buffer} ({side_lbl}) [ENTER]")
+        blf.draw(font_id, f"Distance: {self.typed_buffer} [ENTER]")
     else:
         blf.color(font_id, 0.95, 0.95, 0.95, 1.0)
-        blf.draw(font_id, f"Offset: {dist_str} ({side_lbl}) | Clamp: {clamp_lbl}")
+        blf.draw(font_id, f"Offset: {dist_str} | Clamp: {clamp_lbl}")
 
     blf.position(font_id, 20, 40, 0)
     blf.color(font_id, 1.0, 1.0, 1.0, 0.9)
     blf.draw(font_id,
-             "Poly Offset v2.4.0: Move Mouse / Type Unit + Enter | Shift+F: Flip | Shift+C: Clamp | "
+             "Poly Offset v1.2.0: Move Mouse / Type Unit + Enter | Shift+F: Flip | Shift+C: Clamp | "
              "Enter/LMB: Confirm | Esc: Cancel")
 
     gpu.state.blend_set('NONE')
@@ -1664,42 +1796,68 @@ class MESH_OT_poly_offset(bpy.types.Operator):
         obj = context.edit_object
         bm = bmesh.from_edit_mesh(obj.data)
 
+        bm.normal_update()
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+
         mw = obj.matrix_world
+        nm = mw.to_3x3().inverted().transposed()
+
         chains = collect_offset_chains(bm, mw)
         if not chains:
             self.report({'WARNING'}, "Select edges or a face to offset")
             return {'CANCELLED'}
 
         self.chains = []
+        region, rv3d = get_3d_region_and_rv3d(context)
 
         for chain in chains:
             pts3d = chain['pts_3d']
-            plane_origin = sum(pts3d, mathutils.Vector()) / len(pts3d)
+            v_indices = chain['vert_indices']
+            closed = chain['closed']
 
-            bm.faces.ensure_lookup_table()
-            sel_faces = [f for f in bm.faces if is_valid_elem(f) and f.select]
-            if sel_faces:
-                plane_normal = (mw.to_3x3().inverted().transposed() @ sel_faces[0].normal).normalized()
+            adj_faces = chain_adjacent_faces(bm, v_indices, closed)
+            face_cands = [((nm @ f.normal).normalized(), mw @ f.calc_center_median()) 
+                          for f in adj_faces if is_valid_elem(f)]
+
+            sel_adj_faces = [f for f in adj_faces if is_valid_elem(f) and f.select]
+
+            if sel_adj_faces:
+                init_normal = (nm @ sel_adj_faces[0].normal).normalized()
+                init_origin = mw @ sel_adj_faces[0].calc_center_median()
+            elif face_cands:
+                rv3d_dir = (rv3d.view_matrix.to_3x3().inverted() @ mathutils.Vector((0, 0, -1))).normalized() if rv3d else mathutils.Vector((0, 0, 1))
+                best_cand = max(face_cands, key=lambda c: abs(c[0].dot(rv3d_dir)))
+                init_normal, init_origin = best_cand[0], best_cand[1]
             else:
-                normals = []
-                bm.verts.ensure_lookup_table()
-                for idx in chain['vert_indices']:
-                    if 0 <= idx < len(bm.verts) and is_valid_elem(bm.verts[idx]):
-                        for f in bm.verts[idx].link_faces:
-                            if is_valid_elem(f):
-                                normals.append((mw.to_3x3().inverted().transposed() @ f.normal).normalized())
-                plane_normal = (sum(normals, mathutils.Vector()).normalized() if normals else mathutils.Vector((0, 0, 1)))
+                init_origin = sum(pts3d, mathutils.Vector()) / len(pts3d)
+                init_normal = mathutils.Vector((0, 0, 1))
 
-            plane_u, plane_v = compute_plane_basis(plane_normal)
+            init_u, init_v = compute_plane_basis(init_normal)
+
+            extent = max((p - pts3d[0]).length for p in pts3d) if pts3d else 1.0
+            plane_tol = 1e-4 * extent + 1e-6
+
+            is_planar = True
+            for p in pts3d:
+                if abs((p - init_origin).dot(init_normal)) > plane_tol:
+                    is_planar = False
+                    break
+
+            if not is_planar:
+                self.report({'WARNING'}, "Poly Offset: selected chain is non-planar")
 
             self.chains.append({
-                'vert_indices': chain['vert_indices'],
+                'vert_indices': v_indices,
                 'pts_3d': pts3d,
-                'closed': chain['closed'],
-                'plane_origin': plane_origin,
-                'plane_normal': plane_normal,
-                'plane_u': plane_u,
-                'plane_v': plane_v
+                'closed': closed,
+                'faces': face_cands,
+                'plane_origin': init_origin,
+                'plane_normal': init_normal,
+                'plane_u': init_u,
+                'plane_v': init_v,
+                'is_planar': is_planar
             })
 
         self.area = context.area
@@ -1785,6 +1943,16 @@ class MESH_OT_poly_offset(bpy.types.Operator):
 
         self.mouse_2d = mathutils.Vector((event.mouse_region_x, event.mouse_region_y))
 
+        ray_o = view3d_utils.region_2d_to_origin_3d(region, rv3d, self.mouse_2d)
+        ray_d = view3d_utils.region_2d_to_vector_3d(region, rv3d, self.mouse_2d).normalized()
+
+        for ch in self.chains:
+            if ch.get('faces'):
+                pick = pick_face_under_cursor(ch['faces'], ch['pts_3d'], ray_o, ray_d)
+                if pick:
+                    ch['plane_origin'], ch['plane_normal'] = pick[0], pick[1]
+                    ch['plane_u'], ch['plane_v'] = compute_plane_basis(ch['plane_normal'])
+
         c0 = self.chains[0]
         plane_hit = raycast_plane_intersection(
             region, rv3d, self.mouse_2d, c0['plane_origin'], c0['plane_normal']
@@ -1852,55 +2020,79 @@ class MESH_OT_poly_offset(bpy.types.Operator):
         obj = context.edit_object
         bm = bmesh.from_edit_mesh(obj.data)
 
-        mw = obj.matrix_world
-        imw = mw.inverted()
+        bpy.ops.ed.undo_push(message="Poly Offset Commit")
 
-        unit_scale = context.scene.unit_settings.scale_length
-        obj_scale = max(mw.to_scale())
-        obj_scale = obj_scale if obj_scale > 1e-6 else 1.0
-        local_tol = (1e-3 * unit_scale) / obj_scale
+        try:
+            mw = obj.matrix_world
+            imw = mw.inverted()
 
-        for v in bm.verts:
-            if is_valid_elem(v): v.select = False
-        for e in bm.edges:
-            if is_valid_elem(e): e.select = False
-        for f in bm.faces:
-            if is_valid_elem(f): f.select = False
+            obj_scale = max(mw.to_scale())
+            obj_scale = obj_scale if obj_scale > 1e-6 else 1.0
 
-        selected_edges = []
-        warnings = []
+            min_edge_len = float('inf')
+            chain_extent = 0.0
+            for ch in self.preview_chains:
+                pts = ch['orig_3d']
+                if pts:
+                    ext = max((p - pts[0]).length for p in pts)
+                    if ext > chain_extent:
+                        chain_extent = ext
+                for k in range(len(pts) - 1):
+                    l = (pts[k+1] - pts[k]).length
+                    if 0 < l < min_edge_len:
+                        min_edge_len = l
 
-        for chain in self.preview_chains:
-            off3 = chain['off_3d']
-            orig_indices = chain['vert_indices']
-            if len(off3) < 2:
-                continue
+            if min_edge_len == float('inf'):
+                min_edge_len = 1.0
 
-            results, warn_msg = commit_polyline_offset(
-                bm, orig_indices, off3, chain['plane_origin'], chain['plane_normal'],
-                chain['plane_u'], chain['plane_v'], mw, imw, local_tol, chain['closed'], chain['dist']
-            )
-            selected_edges.extend(results)
-            if warn_msg:
-                warnings.append(warn_msg)
+            local_tol = max(1e-3 * min_edge_len, 1e-6 * chain_extent) / obj_scale
 
-        if warnings:
-            self.report({'WARNING'}, "; ".join(warnings))
+            for v in bm.verts:
+                if is_valid_elem(v): v.select = False
+            for e in bm.edges:
+                if is_valid_elem(e): e.select = False
+            for f in bm.faces:
+                if is_valid_elem(f): f.select = False
 
-        bm.verts.ensure_lookup_table()
-        bm.edges.ensure_lookup_table()
-        bm.faces.ensure_lookup_table()
+            selected_edges = []
+            warnings = []
 
-        context.tool_settings.mesh_select_mode = (False, True, False)
+            for chain in self.preview_chains:
+                off3 = chain['off_3d']
+                orig_indices = chain['vert_indices']
+                if len(off3) < 2:
+                    continue
 
-        for e in selected_edges:
-            if is_valid_elem(e):
-                e.select = True
-                for v in e.verts:
-                    if is_valid_elem(v): v.select = True
+                results, warn_msg = commit_polyline_offset(
+                    bm, orig_indices, off3, chain['plane_origin'], chain['plane_normal'],
+                    chain['plane_u'], chain['plane_v'], mw, imw, local_tol, chain['closed'], chain['dist']
+                )
+                selected_edges.extend(results)
+                if warn_msg:
+                    warnings.append(warn_msg)
 
-        bm.select_flush_mode()
-        bmesh.update_edit_mesh(obj.data)
+            if warnings:
+                self.report({'WARNING'}, "; ".join(warnings))
+
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+
+            context.tool_settings.mesh_select_mode = (False, True, False)
+
+            for e in selected_edges:
+                if is_valid_elem(e):
+                    e.select = True
+                    for v in e.verts:
+                        if is_valid_elem(v): v.select = True
+
+            bm.select_flush_mode()
+            bmesh.update_edit_mesh(obj.data)
+
+        except Exception as ex:
+            bpy.ops.ed.undo()
+            self.report({'ERROR'}, f"Poly Offset commit failed and rolled back: {ex}")
+            raise ex
 
     def cleanup(self, context):
         context.window.cursor_modal_restore()
@@ -1911,8 +2103,8 @@ class MESH_OT_poly_offset(bpy.types.Operator):
             if h is not None:
                 try:
                     bpy.types.SpaceView3D.draw_handler_remove(h, 'WINDOW')
-                except Exception:
-                    pass
+                except Exception as ex:
+                    print(f"[PolyOffset Notice] Handler removal notice: {ex}")
         tag_redraw(context)
 
 
