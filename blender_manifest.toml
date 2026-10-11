@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+id = "polysketch"
+version = "1.0.0"
+name = "PolySketch"
+tagline = "CAD 2D drafting in Object Mode; face cutting and exact offset in Edit Mode (N-Panel > Create)"
+maintainer = "Anupska"
+type = "add-on"
+blender_version_min = "4.2.0"
+license = [
+    "SPDX:GPL-3.0-or-later",
+]
+tags = ["Modeling", "Mesh"]
